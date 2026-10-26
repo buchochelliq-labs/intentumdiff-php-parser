@@ -58,6 +58,16 @@ const SEMANTIC_TYPES: &[&str] = &[
     "property_declaration",
     "const_declaration",
     "enum_case",
+    // Function/method signature structure. These must remain semantic so
+    // adding parameter or return types cannot normalize to the same tree.
+    "formal_parameters",
+    "simple_parameter",
+    "variadic_parameter",
+    "primitive_type",
+    "named_type",
+    "union_type",
+    "intersection_type",
+    "nullable_type",
     // Namespace / use
     "namespace_definition",
     "namespace_use_declaration",
@@ -327,6 +337,23 @@ mod tests {
         t::assert_valid_json(&out, "process(raw example)");
         assert!(!out.contains("\"error\""), "{out}");
     }
+    #[test]
+    fn parameter_and_return_type_changes_are_semantic() {
+        let before = "<?php\nfunction add($a, $b) {\n    return $a + $b;\n}\n";
+        let after = "<?php\nfunction add(int $a, int $b): int {\n    return $a + $b;\n}\n";
+
+        let before_tree = process_impl(before);
+        let after_tree = process_impl(after);
+
+        t::assert_valid_json(&before_tree, "before signature");
+        t::assert_valid_json(&after_tree, "after signature");
+        assert_ne!(before_tree, after_tree, "typed signature must change the semantic tree");
+        assert!(
+            after_tree.contains("primitive_type") && after_tree.contains("int"),
+            "typed signature must retain its type evidence: {after_tree}"
+        );
+    }
+
     #[test]
     fn process_impl_empty_returns_valid_json() {
         let out = process_impl("");
