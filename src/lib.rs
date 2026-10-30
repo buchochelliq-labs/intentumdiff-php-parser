@@ -188,12 +188,47 @@ fn is_method_like(node_type: &str) -> bool {
     )
 }
 
+/// Read a CST node's original UTF-8 source slice from its Tree-sitter byte
+/// coordinates. A typed PHP parameter is one semantic signature, not merely
+/// a variable name: dropping the type from its label can hide a source-anchored
+/// parent modification behind individual primitive_type insertions (#5).
+fn original_node_text<'a>(source: &'a str, node: &CstNode) -> Option<&'a str> {
+    fn offset(source: &str, row: u32, col: u32) -> Option<usize> {
+        let mut line_start = 0;
+        for _ in 0..row {
+            let newline = source.get(line_start..)?.find('\n')?;
+            line_start += newline + 1;
+        }
+        let line_end = source.get(line_start..)?
+            .find('\n').map(|i| line_start + i).unwrap_or(source.len());
+        let absolute = line_start.checked_add(col as usize)?;
+        (absolute <= line_end).then_some(absolute)
+    }
+    let start = offset(source, node.start_line, node.start_col)?;
+    let end = offset(source, node.end_line, node.end_col)?;
+    source.get(start..end)
+}
+
 fn convert(
     node: &CstNode,
     id_prefix: &str,
     parent_class: Option<&str>,
     memo: &mut std::collections::HashMap<usize, String>,
+    source: &str,
 ) -> Option<SemanticNode> {
+    // The parser already knows each node's exact source byte range. Preserve
+    // the full typed-parameter signature for matching and presentation while
+    // keeping granular primitive_type children for precise type edits.
+    let label_with_signature = |candidate: &CstNode| {
+        if candidate.node_type == "simple_parameter" {
+            if let Some(text) = original_node_text(source, candidate) {
+                if !text.is_empty() {
+                    return text.to_string();
+                }
+            }
+        }
+        label_for(candidate)
+    };
     convert_semantic_classed(
         node,
         id_prefix,
@@ -203,7 +238,7 @@ fn convert(
         &is_semantic,
         &is_class_like,
         &is_method_like,
-        &label_for,
+        &label_with_signature,
     )
 }
 
@@ -229,7 +264,7 @@ fn process_impl(source: &str) -> String {
         Err(e) => return format!(r#"{{\"error\":\"{}\"}}"#, e),
     };
     let mut memo: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
-    let sem = match convert(&root, "0", None, &mut memo) {
+    let sem = match convert(&root, "0", None, &mut memo, source) {
         Some(n) => n,
         None => return r#"{"error":"Empty semantic tree"}"#.to_string(),
     };
