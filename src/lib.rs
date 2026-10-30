@@ -389,6 +389,55 @@ mod tests {
         );
     }
 
+    fn collect_nodes_of_type<'a>(
+        tree: &'a serde_json::Value,
+        node_type: &str,
+        out: &mut Vec<&'a serde_json::Value>,
+    ) {
+        if tree["node_type"] == node_type {
+            out.push(tree);
+        }
+        if let Some(children) = tree["children"].as_array() {
+            for child in children {
+                collect_nodes_of_type(child, node_type, out);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_php_parameter_label_and_span_include_complete_declaration() {
+        let before = "<?php\nfunction add($a, $b) {\n    return $a + $b;\n}\n";
+        let after = "<?php\nfunction add(int $a, int $b): int {\n    return $a + $b;\n}\n";
+        let old_tree: serde_json::Value =
+            serde_json::from_str(&process_impl(before)).unwrap();
+        let new_tree: serde_json::Value =
+            serde_json::from_str(&process_impl(after)).unwrap();
+        let mut old_params = Vec::new();
+        let mut new_params = Vec::new();
+        collect_nodes_of_type(&old_tree, "simple_parameter", &mut old_params);
+        collect_nodes_of_type(&new_tree, "simple_parameter", &mut new_params);
+        assert_eq!(old_params.len(), 2, "untyped parameters remain structured");
+        assert_eq!(new_params.len(), 2, "typed parameters remain structured");
+        assert_eq!(old_params[0]["label"], "$a");
+        assert_eq!(new_params[0]["label"], "int $a");
+        assert_eq!(new_params[1]["label"], "int $b");
+        assert_ne!(
+            old_params[0]["structural_hash"],
+            new_params[0]["structural_hash"],
+            "type addition must alter parameter semantics"
+        );
+        assert_eq!(new_params[0]["position"]["start_line"], 1);
+        assert_eq!(new_params[0]["position"]["end_line"], 1);
+        assert_eq!(new_params[0]["position"]["start_col"], 13);
+        assert_eq!(new_params[0]["position"]["end_col"], 19);
+        assert_eq!(new_params[1]["position"]["start_col"], 21);
+        assert_eq!(new_params[1]["position"]["end_col"], 27);
+        assert!(
+            new_tree.to_string().contains("primitive_type"),
+            "granular type evidence must not disappear"
+        );
+    }
+
     #[test]
     fn process_impl_empty_returns_valid_json() {
         let out = process_impl("");
