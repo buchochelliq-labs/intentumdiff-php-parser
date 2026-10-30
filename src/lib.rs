@@ -188,12 +188,47 @@ fn is_method_like(node_type: &str) -> bool {
     )
 }
 
+/// Read a CST node's original UTF-8 source slice from its Tree-sitter byte
+/// coordinates. A typed PHP parameter is one semantic signature, not merely
+/// a variable name: dropping the type from its label can hide a source-anchored
+/// parent modification behind individual primitive_type insertions (#5).
+fn original_node_text<'a>(source: &'a str, node: &CstNode) -> Option<&'a str> {
+    fn offset(source: &str, row: u32, col: u32) -> Option<usize> {
+        let mut line_start = 0;
+        for _ in 0..row {
+            let newline = source.get(line_start..)?.find('\n')?;
+            line_start += newline + 1;
+        }
+        let line_end = source.get(line_start..)?
+            .find('\n').map(|i| line_start + i).unwrap_or(source.len());
+        let absolute = line_start.checked_add(col as usize)?;
+        (absolute <= line_end).then_some(absolute)
+    }
+    let start = offset(source, node.start_line, node.start_col)?;
+    let end = offset(source, node.end_line, node.end_col)?;
+    source.get(start..end)
+}
+
 fn convert(
     node: &CstNode,
     id_prefix: &str,
     parent_class: Option<&str>,
     memo: &mut std::collections::HashMap<usize, String>,
+    source: &str,
 ) -> Option<SemanticNode> {
+    // The parser already knows each node's exact source byte range. Preserve
+    // the full typed-parameter signature for matching and presentation while
+    // keeping granular primitive_type children for precise type edits.
+    let label_with_signature = |candidate: &CstNode| {
+        if candidate.node_type == "simple_parameter" {
+            if let Some(text) = original_node_text(source, candidate) {
+                if !text.is_empty() {
+                    return text.to_string();
+                }
+            }
+        }
+        label_for(candidate)
+    };
     convert_semantic_classed(
         node,
         id_prefix,
@@ -203,7 +238,7 @@ fn convert(
         &is_semantic,
         &is_class_like,
         &is_method_like,
-        &label_for,
+        &label_with_signature,
     )
 }
 
@@ -229,7 +264,7 @@ fn process_impl(source: &str) -> String {
         Err(e) => return format!(r#"{{\"error\":\"{}\"}}"#, e),
     };
     let mut memo: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
-    let sem = match convert(&root, "0", None, &mut memo) {
+    let sem = match convert(&root, "0", None, &mut memo, source) {
         Some(n) => n,
         None => return r#"{"error":"Empty semantic tree"}"#.to_string(),
     };
@@ -351,6 +386,55 @@ mod tests {
         assert!(
             after_tree.contains("primitive_type") && after_tree.contains("int"),
             "typed signature must retain its type evidence: {after_tree}"
+        );
+    }
+
+    fn collect_nodes_of_type<'a>(
+        tree: &'a serde_json::Value,
+        node_type: &str,
+        out: &mut Vec<&'a serde_json::Value>,
+    ) {
+        if tree["node_type"] == node_type {
+            out.push(tree);
+        }
+        if let Some(children) = tree["children"].as_array() {
+            for child in children {
+                collect_nodes_of_type(child, node_type, out);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_php_parameter_label_and_span_include_complete_declaration() {
+        let before = "<?php\nfunction add($a, $b) {\n    return $a + $b;\n}\n";
+        let after = "<?php\nfunction add(int $a, int $b): int {\n    return $a + $b;\n}\n";
+        let old_tree: serde_json::Value =
+            serde_json::from_str(&process_impl(before)).unwrap();
+        let new_tree: serde_json::Value =
+            serde_json::from_str(&process_impl(after)).unwrap();
+        let mut old_params = Vec::new();
+        let mut new_params = Vec::new();
+        collect_nodes_of_type(&old_tree, "simple_parameter", &mut old_params);
+        collect_nodes_of_type(&new_tree, "simple_parameter", &mut new_params);
+        assert_eq!(old_params.len(), 2, "untyped parameters remain structured");
+        assert_eq!(new_params.len(), 2, "typed parameters remain structured");
+        assert_eq!(old_params[0]["label"], "$a");
+        assert_eq!(new_params[0]["label"], "int $a");
+        assert_eq!(new_params[1]["label"], "int $b");
+        assert_ne!(
+            old_params[0]["structural_hash"],
+            new_params[0]["structural_hash"],
+            "type addition must alter parameter semantics"
+        );
+        assert_eq!(new_params[0]["position"]["start_line"], 1);
+        assert_eq!(new_params[0]["position"]["end_line"], 1);
+        assert_eq!(new_params[0]["position"]["start_col"], 13);
+        assert_eq!(new_params[0]["position"]["end_col"], 19);
+        assert_eq!(new_params[1]["position"]["start_col"], 21);
+        assert_eq!(new_params[1]["position"]["end_col"], 27);
+        assert!(
+            new_tree.to_string().contains("primitive_type"),
+            "granular type evidence must not disappear"
         );
     }
 
