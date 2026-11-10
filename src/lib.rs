@@ -108,6 +108,11 @@ const SEMANTIC_TYPES: &[&str] = &[
     "variable_name",
     "qualified_name",
     "string",
+    // Double-quoted / heredoc / nowdoc strings are distinct tree-sitter-php
+    // kinds; without them an echoed "café" -> "cafè" edit vanished (#7).
+    "encapsed_string",
+    "heredoc",
+    "nowdoc",
     "integer",
     "boolean",
     "null",
@@ -220,7 +225,12 @@ fn convert(
     // the full typed-parameter signature for matching and presentation while
     // keeping granular primitive_type children for precise type edits.
     let label_with_signature = |candidate: &CstNode| {
-        if candidate.node_type == "simple_parameter" {
+        // String literals label with their complete source payload: the SDK's
+        // literal_label truncates at 120 chars, which would hide edits past it (#7).
+        if matches!(
+            candidate.node_type.as_str(),
+            "simple_parameter" | "string" | "encapsed_string" | "heredoc" | "nowdoc"
+        ) {
             if let Some(text) = original_node_text(source, candidate) {
                 if !text.is_empty() {
                     return text.to_string();
@@ -436,6 +446,72 @@ mod tests {
             new_tree.to_string().contains("primitive_type"),
             "granular type evidence must not disappear"
         );
+    }
+
+    fn first_node_of_type(tree: &serde_json::Value, node_type: &str) -> serde_json::Value {
+        let mut found = Vec::new();
+        collect_nodes_of_type(tree, node_type, &mut found);
+        assert!(!found.is_empty(), "no {node_type} in {tree}");
+        found[0].clone()
+    }
+
+    #[test]
+    fn echoed_double_quoted_unicode_string_edit_is_retained() {
+        // Exact pair from dynamic/php/unicode-value (#7).
+        let before = "<?php echo \"caf\u{e9}\";\n";
+        let after = "<?php echo \"caf\u{e8}\";\n";
+        let old_tree: serde_json::Value = serde_json::from_str(&process_impl(before)).unwrap();
+        let new_tree: serde_json::Value = serde_json::from_str(&process_impl(after)).unwrap();
+        let old_s = first_node_of_type(&old_tree, "encapsed_string");
+        let new_s = first_node_of_type(&new_tree, "encapsed_string");
+        assert_eq!(old_s["label"], "\"caf\u{e9}\"");
+        assert_eq!(new_s["label"], "\"caf\u{e8}\"");
+        assert_ne!(old_s["structural_hash"], new_s["structural_hash"]);
+        // 0-based row, UTF-8 byte columns: `"café"` is 7 bytes starting at col 11.
+        assert_eq!(new_s["position"]["start_line"], 0);
+        assert_eq!(new_s["position"]["start_col"], 11);
+        assert_eq!(new_s["position"]["end_col"], 18);
+        let echo_old = first_node_of_type(&old_tree, "echo_statement");
+        let echo_new = first_node_of_type(&new_tree, "echo_statement");
+        assert_ne!(echo_old["structural_hash"], echo_new["structural_hash"]);
+    }
+
+    #[test]
+    fn identical_and_spacing_only_echo_strings_are_preserved() {
+        let src = "<?php echo \"caf\u{e9}\";\n";
+        assert_eq!(process_impl(src), process_impl(src), "deterministic");
+        let spaced = "<?php echo   \"caf\u{e9}\" ;\n";
+        let a: serde_json::Value = serde_json::from_str(&process_impl(src)).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&process_impl(spaced)).unwrap();
+        let sa = first_node_of_type(&a, "encapsed_string");
+        let sb = first_node_of_type(&b, "encapsed_string");
+        assert_eq!(sa["label"], sb["label"]);
+        assert_eq!(sa["structural_hash"], sb["structural_hash"]);
+        assert_eq!(a["structural_hash"], b["structural_hash"]);
+    }
+
+    #[test]
+    fn long_string_payload_is_not_truncated() {
+        let long = "x".repeat(200);
+        let before = format!("<?php echo \"{long}a\";\n");
+        let after = format!("<?php echo \"{long}b\";\n");
+        let old_tree: serde_json::Value = serde_json::from_str(&process_impl(&before)).unwrap();
+        let new_tree: serde_json::Value = serde_json::from_str(&process_impl(&after)).unwrap();
+        let old_s = first_node_of_type(&old_tree, "encapsed_string");
+        let new_s = first_node_of_type(&new_tree, "encapsed_string");
+        assert_eq!(old_s["label"].as_str().unwrap(), format!("\"{long}a\""));
+        assert_ne!(old_s["label"], new_s["label"]);
+    }
+
+    #[test]
+    fn heredoc_and_single_quoted_strings_keep_payload() {
+        let single: serde_json::Value =
+            serde_json::from_str(&process_impl("<?php echo 'caf\u{e9}';\n")).unwrap();
+        assert_eq!(first_node_of_type(&single, "string")["label"], "'caf\u{e9}'");
+        let heredoc: serde_json::Value =
+            serde_json::from_str(&process_impl("<?php echo <<<EOT\ncaf\u{e9}\nEOT;\n")).unwrap();
+        let h = first_node_of_type(&heredoc, "heredoc");
+        assert!(h["label"].as_str().unwrap().contains("caf\u{e9}"), "{h}");
     }
 
     #[test]
