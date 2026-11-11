@@ -193,25 +193,43 @@ fn is_method_like(node_type: &str) -> bool {
     )
 }
 
-/// Read a CST node's original UTF-8 source slice from its Tree-sitter byte
-/// coordinates. A typed PHP parameter is one semantic signature, not merely
-/// a variable name: dropping the type from its label can hide a source-anchored
-/// parent modification behind individual primitive_type insertions (#5).
-fn original_node_text<'a>(source: &'a str, node: &CstNode) -> Option<&'a str> {
-    fn offset(source: &str, row: u32, col: u32) -> Option<usize> {
-        let mut line_start = 0;
-        for _ in 0..row {
-            let newline = source.get(line_start..)?.find('\n')?;
-            line_start += newline + 1;
-        }
-        let line_end = source.get(line_start..)?
-            .find('\n').map(|i| line_start + i).unwrap_or(source.len());
+/// Byte offset of the start of every line of a source, computed once per parse
+/// so that slicing each node's source text stays linear in the file size (#9).
+struct LineIndex<'a> {
+    source: &'a str,
+    starts: Vec<usize>,
+}
+
+impl<'a> LineIndex<'a> {
+    fn new(source: &'a str) -> Self {
+        let starts = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        Self { source, starts }
+    }
+
+    /// Absolute byte offset of a 0-based row and UTF-8 byte column, or `None`
+    /// if it lies outside the source or past the end of its line.
+    fn offset(&self, row: u32, col: u32) -> Option<usize> {
+        let line_start = *self.starts.get(row as usize)?;
+        let line_end = self
+            .starts
+            .get(row as usize + 1)
+            .map_or(self.source.len(), |next| next - 1);
         let absolute = line_start.checked_add(col as usize)?;
         (absolute <= line_end).then_some(absolute)
     }
-    let start = offset(source, node.start_line, node.start_col)?;
-    let end = offset(source, node.end_line, node.end_col)?;
-    source.get(start..end)
+
+    /// Read a CST node's original UTF-8 source slice from its Tree-sitter
+    /// coordinates. A typed PHP parameter is one semantic signature, not merely
+    /// a variable name: dropping the type from its label can hide a
+    /// source-anchored parent modification behind individual primitive_type
+    /// insertions (#5).
+    fn node_text(&self, node: &CstNode) -> Option<&'a str> {
+        let start = self.offset(node.start_line, node.start_col)?;
+        let end = self.offset(node.end_line, node.end_col)?;
+        self.source.get(start..end)
+    }
 }
 
 fn convert(
@@ -224,6 +242,7 @@ fn convert(
     // The parser already knows each node's exact source byte range. Preserve
     // the full typed-parameter signature for matching and presentation while
     // keeping granular primitive_type children for precise type edits.
+    let lines = LineIndex::new(source);
     let label_with_signature = |candidate: &CstNode| {
         // String literals label with their complete source payload: the SDK's
         // literal_label truncates at 120 chars, which would hide edits past it (#7).
@@ -231,7 +250,7 @@ fn convert(
             candidate.node_type.as_str(),
             "simple_parameter" | "string" | "encapsed_string" | "heredoc" | "nowdoc"
         ) {
-            if let Some(text) = original_node_text(source, candidate) {
+            if let Some(text) = lines.node_text(candidate) {
                 if !text.is_empty() {
                     return text.to_string();
                 }
@@ -251,8 +270,6 @@ fn convert(
         &label_with_signature,
     )
 }
-
-
 
 use intentumdiff_plugin_sdk::ts_convert::{convert_semantic_classed, node_to_cst};
 
@@ -392,7 +409,10 @@ mod tests {
 
         t::assert_valid_json(&before_tree, "before signature");
         t::assert_valid_json(&after_tree, "after signature");
-        assert_ne!(before_tree, after_tree, "typed signature must change the semantic tree");
+        assert_ne!(
+            before_tree, after_tree,
+            "typed signature must change the semantic tree"
+        );
         assert!(
             after_tree.contains("primitive_type") && after_tree.contains("int"),
             "typed signature must retain its type evidence: {after_tree}"
@@ -418,10 +438,8 @@ mod tests {
     fn typed_php_parameter_label_and_span_include_complete_declaration() {
         let before = "<?php\nfunction add($a, $b) {\n    return $a + $b;\n}\n";
         let after = "<?php\nfunction add(int $a, int $b): int {\n    return $a + $b;\n}\n";
-        let old_tree: serde_json::Value =
-            serde_json::from_str(&process_impl(before)).unwrap();
-        let new_tree: serde_json::Value =
-            serde_json::from_str(&process_impl(after)).unwrap();
+        let old_tree: serde_json::Value = serde_json::from_str(&process_impl(before)).unwrap();
+        let new_tree: serde_json::Value = serde_json::from_str(&process_impl(after)).unwrap();
         let mut old_params = Vec::new();
         let mut new_params = Vec::new();
         collect_nodes_of_type(&old_tree, "simple_parameter", &mut old_params);
@@ -432,8 +450,7 @@ mod tests {
         assert_eq!(new_params[0]["label"], "int $a");
         assert_eq!(new_params[1]["label"], "int $b");
         assert_ne!(
-            old_params[0]["structural_hash"],
-            new_params[0]["structural_hash"],
+            old_params[0]["structural_hash"], new_params[0]["structural_hash"],
             "type addition must alter parameter semantics"
         );
         assert_eq!(new_params[0]["position"]["start_line"], 1);
@@ -507,11 +524,44 @@ mod tests {
     fn heredoc_and_single_quoted_strings_keep_payload() {
         let single: serde_json::Value =
             serde_json::from_str(&process_impl("<?php echo 'caf\u{e9}';\n")).unwrap();
-        assert_eq!(first_node_of_type(&single, "string")["label"], "'caf\u{e9}'");
+        assert_eq!(
+            first_node_of_type(&single, "string")["label"],
+            "'caf\u{e9}'"
+        );
         let heredoc: serde_json::Value =
             serde_json::from_str(&process_impl("<?php echo <<<EOT\ncaf\u{e9}\nEOT;\n")).unwrap();
         let h = first_node_of_type(&heredoc, "heredoc");
         assert!(h["label"].as_str().unwrap().contains("caf\u{e9}"), "{h}");
+    }
+
+    fn string_heavy_source(lines: usize) -> String {
+        let mut src = String::from("<?php\n");
+        for i in 0..lines {
+            src.push_str(&format!("echo \"x{i}\";\n"));
+        }
+        src
+    }
+
+    #[test]
+    fn string_heavy_file_parses_in_linear_time() {
+        // Issue #9: locating each string's source slice rescanned the file
+        // from the start, so 20,000 one-string lines took seconds.
+        let src = string_heavy_source(20_000);
+        let started = std::time::Instant::now();
+        let out = process_impl(&src);
+        let elapsed = started.elapsed();
+        // Generous bound for unoptimized test builds; the quadratic scan
+        // alone needed ~28 s in a test build (~6 s optimized).
+        assert!(elapsed.as_secs_f64() < 10.0, "took {elapsed:?}");
+        let tree: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let mut strings = Vec::new();
+        collect_nodes_of_type(&tree, "encapsed_string", &mut strings);
+        assert_eq!(strings.len(), 20_000);
+        for (i, s) in strings.iter().enumerate() {
+            assert_eq!(s["label"].as_str().unwrap(), format!("\"x{i}\""));
+            assert_eq!(s["position"]["start_line"], i as u64 + 1);
+            assert_eq!(s["position"]["start_col"], 5);
+        }
     }
 
     #[test]
